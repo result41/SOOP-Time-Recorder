@@ -8,7 +8,6 @@
 // @match        https://stbbs.sooplive.co.kr/vodclip/index.php/*
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @license MIT
 // ==/UserScript==
 
 (function() {
@@ -243,8 +242,7 @@
         btnHistory.innerText = 'History';
         styleButton(btnHistory, '#2196F3');
         btnHistory.onclick = openHistoryWindow;
-
-        // **V1.44 추가: Delete 버튼**
+        
         const btnDelete = document.createElement('button');
         btnDelete.innerText = 'Delete';
         styleButton(btnDelete, '#f44336');
@@ -357,7 +355,6 @@
         const doc = historyWindow.document;
         doc.title = 'SOOP 타임스탬프 기록';
 
-        // 팝업 HTML (V1.44: 팝업 내 삭제 버튼 제거)
         doc.write(`
             <html>
             <head>
@@ -449,7 +446,7 @@
                             return;
                         }
 
-                        const textToCopy = historyData.slice().reverse().map(item => {
+                        const textToCopy = historyData.slice().map(item => {
                             const baseTime = '[ ' + item.videoTime + ' ]';
                             const memoText = item.memo ? item.memo.trim() : "";
                             return memoText ? baseTime + ' - ' + memoText : baseTime;
