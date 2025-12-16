@@ -8,6 +8,7 @@
 // @match        https://stbbs.sooplive.co.kr/vodclip/index.php/*
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @license MIT
 // ==/UserScript==
 
 (function() {
