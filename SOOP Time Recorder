@@ -1,0 +1,548 @@
+// ==UserScript==
+// @name         SOOP Time Recorder
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  SOOP 라이브 플레이어에서 타임스탬프 기록 및 관리
+// @author       result41
+// @match        https://play.sooplive.co.kr/*
+// @match        https://stbbs.sooplive.co.kr/vodclip/index.php/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @license MIT
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    let historyWindow = null;
+    const IS_CLIP_POPUP = window.location.host === 'stbbs.sooplive.co.kr';
+    
+    function showToast(message) {
+        const existingToast = document.getElementById('soop_custom_toast');
+        if (existingToast) { existingToast.remove(); }
+        if (IS_CLIP_POPUP) return;
+        const toast = document.createElement('div');
+        toast.id = 'soop_custom_toast';
+        toast.style.position = 'fixed';
+        toast.style.bottom = '100px';
+        toast.style.left = '50%';
+        toast.style.transform = 'translateX(-50%)';
+        toast.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+        toast.style.color = '#fff';
+        toast.style.padding = '10px 20px';
+        toast.style.borderRadius = '5px';
+        toast.style.zIndex = '999999';
+        toast.style.opacity = '0';
+        toast.style.transition = 'opacity 0.3s ease-in-out';
+        toast.style.fontSize = '14px';
+        toast.innerText = message;
+        document.documentElement.appendChild(toast);
+        setTimeout(() => { toast.style.opacity = '1'; }, 10);
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            toast.addEventListener('transitionend', () => {
+                if (toast.parentNode) { toast.parentNode.removeChild(toast); }
+            });
+        }, 3000);
+    }
+
+    function extractBjIdFromPath() {
+        const path = window.location.pathname;
+        const pathMatch = path.match(/^\/([^\/]+)\/\d+/);
+        return pathMatch && pathMatch[1] ? pathMatch[1] : null;
+    }
+
+    function extractBjIdFromUrl(url) {
+        const queryMatch = url.match(/bj_id=([^&]+)/);
+        return queryMatch && queryMatch[1] ? queryMatch[1] : null;
+    }
+
+    function getStorageKey(bjId) {
+        return `soop_record_${bjId || 'default'}`;
+    }
+
+    function getCleanedHistory(bjId) {
+        const key = getStorageKey(bjId);
+        let storedData = JSON.parse(GM_getValue(key, '[]'));
+        if (!Array.isArray(storedData)) { storedData = []; }
+        const now = Date.now();
+        const validHistory = storedData.filter(item => {
+            return !item.expiry || item.expiry > now;
+        });
+        if (validHistory.length !== storedData.length) {
+            GM_setValue(key, JSON.stringify(validHistory));
+        }
+        return validHistory;
+    }
+
+    function setHistory(bjId, historyArray) {
+        const key = getStorageKey(bjId);
+        GM_setValue(key, JSON.stringify(historyArray));
+    }
+
+    function deleteHistory() {
+        if (!confirm("정말 모든 기록을 삭제하시겠습니까?")) {
+            return;
+        }
+
+        const bjId = extractBjIdFromPath();
+        const key = getStorageKey(bjId);
+
+        GM_setValue(key, null);
+
+        showToast(`✔ 기록이 모두 삭제되었습니다.`);
+
+        if (historyWindow && !historyWindow.closed) {
+            historyWindow.close();
+            historyWindow = null;
+        }
+    }
+
+    function updateMemo(id, newMemo) {
+        const bjId = extractBjIdFromPath();
+        const history = getCleanedHistory(bjId);
+        const index = history.findIndex(item => item.id === id);
+        if (index > -1) {
+            history[index].memo = newMemo;
+            setHistory(bjId, history);
+        }
+    }
+    // ---------------------------------------------
+
+
+    if (IS_CLIP_POPUP) {
+        function waitForPopupElements() {
+            const bjIdQuery = extractBjIdFromUrl(window.location.href);
+            if (!bjIdQuery) return;
+            let attempts = 0;
+            const maxAttempts = 20;
+            const interval = setInterval(() => {
+                const titleElement = document.querySelector('.u_clip_title ');
+                attempts++;
+                if (titleElement) {
+                    clearInterval(interval);
+                    displayClipTimer(bjIdQuery, titleElement);
+                } else if (attempts >= maxAttempts) {
+                    clearInterval(interval);
+                }
+            }, 500);
+        }
+
+        function displayClipTimer(bjId, titleElement) {
+            const history = getCleanedHistory(bjId);
+            if (history.length === 0) return;
+            const latestRecord = history[history.length - 1];
+            if (!latestRecord.expiry) return;
+            const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+            const savedTimeMs = latestRecord.expiry - THIRTY_DAYS_MS;
+            const now = Date.now();
+            const TEN_MINUTES_MS = 10 * 60 * 1000;
+            const timeElapsed = now - savedTimeMs;
+
+            if (timeElapsed < TEN_MINUTES_MS) {
+                const timeLeftMs = TEN_MINUTES_MS - timeElapsed;
+                const minutes = Math.floor(timeLeftMs / 60000);
+                const seconds = Math.floor((timeLeftMs % 60000) / 1000);
+                const timeString = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+
+                const timerSpan = document.createElement('span');
+                timerSpan.style.marginRight = '10px';
+                timerSpan.style.fontWeight = 'bold';
+                timerSpan.style.color = '#8e958c';
+                timerSpan.innerText = `⏳ 마지막 Record 시간: ${timeString}`;
+
+                titleElement.parentNode.insertBefore(timerSpan, titleElement);
+            }
+        }
+        waitForPopupElements();
+        return;
+    }
+
+
+    // --- 메인 페이지 로직 (play.sooplive.co.kr) ---
+    const MAX_ATTEMPTS = 40;
+    let attempts = 0;
+
+    const loadInterval = setInterval(() => {
+        if (attempts >= MAX_ATTEMPTS) {
+            clearInterval(loadInterval);
+            console.error("SOOP Time Recorder: 버튼 삽입 위치를 찾지 못하고 종료합니다.");
+            return;
+        }
+
+        // 1. 기존의 안전한 위치 (#broadInfo 내 #broadState 옆) 시도
+        const broadState = document.querySelector('#broadInfo #broadState');
+        if (broadState && !document.getElementById('soop_custom_buttons')) {
+            clearInterval(loadInterval);
+            createButtons(broadState, 'broadState'); // 1순위 삽입
+            return;
+        }
+
+        // 2. 대체 위치 (#broadArea 내부 상단) 시도
+        const broadcastArea = document.querySelector('#broadcastArea');
+        if (broadcastArea && !document.getElementById('soop_custom_buttons')) {
+            if (!broadState) {
+                clearInterval(loadInterval);
+                createButtons(broadcastArea, 'broadcastArea'); // 2순위 삽입
+                return;
+            }
+        }
+
+        attempts++;
+    }, 500);
+    // ----------------------------------------------------
+
+
+    window.addEventListener('message', (event) => {
+        if (!event.data || event.data.source !== 'soop_time_recorder_popup') {
+            return;
+        }
+
+        const { action, value, historyUpdates } = event.data;
+
+        switch (action) {
+
+            case 'SAVE_ALL_MEMOS':
+                if (historyUpdates && Array.isArray(historyUpdates)) {
+                    const bjId = extractBjIdFromPath();
+                    const currentHistory = getCleanedHistory(bjId);
+
+                    historyUpdates.forEach(update => {
+                        const index = currentHistory.findIndex(item => item.id === update.id);
+                        if (index > -1) {
+                            currentHistory[index].memo = update.memo;
+                        }
+                    });
+
+                    setHistory(bjId, currentHistory);
+
+                    if (value === 'COPYING') {
+                        if (historyWindow && !historyWindow.closed && historyWindow.startCopy) {
+                            historyWindow.startCopy();
+                        }
+                    }
+                }
+                break;
+        }
+    });
+    // ----------------------------------------------------
+
+
+    // --- 버튼 및 팝업 관련 함수 정의 ---
+    function createButtons(targetElement, insertType) {
+        const container = document.createElement('span');
+        container.id = 'soop_custom_buttons';
+
+        // 버튼 3개 생성
+        const btnRecord = document.createElement('button');
+        btnRecord.innerText = 'Record';
+        styleButton(btnRecord, '#4CAF50');
+        btnRecord.onclick = recordTime;
+
+        const btnHistory = document.createElement('button');
+        btnHistory.innerText = 'History';
+        styleButton(btnHistory, '#2196F3');
+        btnHistory.onclick = openHistoryWindow;
+
+        // **V1.44 추가: Delete 버튼**
+        const btnDelete = document.createElement('button');
+        btnDelete.innerText = 'Delete';
+        styleButton(btnDelete, '#f44336');
+        btnDelete.onclick = deleteHistory;
+
+
+        if (insertType === 'broadState') {
+            container.style.marginLeft = '10px';
+            container.style.display = 'inline-flex';
+            container.style.alignItems = 'center';
+            container.style.gap = '5px';
+            container.style.position = 'relative';
+
+            container.appendChild(btnRecord);
+            container.appendChild(btnHistory);
+            container.appendChild(btnDelete);
+
+            targetElement.parentNode.insertBefore(container, targetElement.nextSibling);
+
+        } else if (insertType === 'broadcastArea') {
+            container.style.display = 'block';
+            container.style.position = 'absolute';
+            container.style.top = '10px';
+            container.style.right = '10px';
+            container.style.zIndex = '10';
+
+            const innerFlex = document.createElement('div');
+            innerFlex.style.display = 'flex';
+            innerFlex.style.gap = '5px';
+            container.appendChild(innerFlex);
+
+            innerFlex.appendChild(btnRecord);
+            innerFlex.appendChild(btnHistory);
+            innerFlex.appendChild(btnDelete);
+
+            targetElement.appendChild(container);
+        }
+    }
+
+    function recordTime() {
+        const timeElement = document.querySelector('#broadInfo #time');
+        if (!timeElement) {
+            showToast("시간 정보를 찾을 수 없습니다.");
+            return;
+        }
+
+        const currentTime = timeElement.innerText.trim();
+        if (currentTime === "00:00:00") {
+            showToast("시간 정보를 찾을 수 없습니다.");
+            return;
+        }
+
+        const now = new Date();
+        const timestamp = now.toLocaleTimeString();
+
+        const bjId = extractBjIdFromPath();
+        if (!bjId) {
+            showToast("방송인 ID를 찾을 수 없어 기록할 수 없습니다.");
+            return;
+        }
+
+        const key = getStorageKey(bjId);
+
+        const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+        const expiryTime = now.getTime() + THIRTY_DAYS_MS;
+
+        const history = getCleanedHistory(bjId);
+
+        history.push({
+            id: Date.now().toString() + Math.random().toString(36).substring(2, 9),
+            videoTime: currentTime,
+            memo: "",
+            savedAt: timestamp,
+            expiry: expiryTime
+        });
+
+        setHistory(bjId, history);
+        showToast(`✔ 타임스탬프 저장됨: ${currentTime} `);
+
+        if (historyWindow && !historyWindow.closed) {
+             historyWindow.close();
+             historyWindow = null;
+             openHistoryWindow();
+        }
+    }
+
+    function openHistoryWindow() {
+        if (historyWindow && !historyWindow.closed) {
+            historyWindow.focus();
+            return;
+        }
+
+        const bjId = extractBjIdFromPath();
+        if (!bjId) {
+            showToast("BJ ID를 찾을 수 없어 History를 열 수 없습니다.");
+            return;
+        }
+
+        const currentHistory = getCleanedHistory(bjId);
+        const escapedHistoryJson = JSON.stringify(currentHistory).replace(/</g, '\\u003c');
+
+
+        historyWindow = window.open('', 'SOOP_Time_History', 'width=450,height=550,scrollbars=no,resizable=yes');
+
+        if (!historyWindow) {
+            alert('팝업 창이 차단되었습니다. 팝업 차단을 해제해 주세요.');
+            return;
+        }
+
+        const doc = historyWindow.document;
+        doc.title = 'SOOP 타임스탬프 기록';
+
+        // 팝업 HTML (V1.44: 팝업 내 삭제 버튼 제거)
+        doc.write(`
+            <html>
+            <head>
+                <style>
+                    html, body {
+                        height: 100%; margin: 0; padding: 0; overflow: hidden;
+                    }
+                    body {
+                        font-family: sans-serif; background-color: #2c2c2c; color: #fff; padding: 15px;
+                        display: flex; flex-direction: column; box-sizing: border-box;
+                    }
+                    h3 {
+                        color: #FFD700; border-bottom: 2px solid #555; padding-bottom: 5px; margin-top: 0;
+                        flex-shrink: 0;
+                    }
+                    #content_area { flex-grow: 1; display: flex; flex-direction: column; overflow: hidden; }
+                    #list_container { flex-grow: 1; overflow-y: auto; padding-right: 10px; margin-bottom: 15px; }
+                    ul { list-style: none; padding: 0; margin: 0; }
+                    li { border-bottom: 1px solid #444; padding: 8px 0; margin-bottom: 10px; display: flex; flex-direction: column; }
+                    .header-line { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 5px; }
+                    .video-time { font-weight: bold; color: #4CAF50; font-size: 1.2em; }
+                    .memo-input {
+                        width: 100%; height: 50px; padding: 5px; box-sizing: border-box; border: 1px solid #555;
+                        background-color: #3a3a3a; color: white; margin-top: 5px; resize: vertical; font-family: sans-serif;
+                    }
+                    .saved-at { font-size: 0.8em; color: #aaa; margin-top: 2px; margin-left: 10px; }
+                    .history-btn {
+                        border: none; padding: 8px; border-radius: 4px; cursor: pointer;
+                        font-weight: bold; width: 100%; box-sizing: border-box; flex-shrink: 0;
+                        margin-bottom: 5px;
+                    }
+                    /* Delete 버튼 스타일 제거 */
+                    #copy_btn { background-color: #2196F3; color: white; }
+                    #copy_btn:hover { background-color: #1976D2; }
+                    .empty-message { color: #ccc; text-align: center; padding: 20px; }
+                </style>
+            </head>
+            <body>
+                <h3>SOOP 타임스탬프 기록 (${bjId})</h3>
+                <div id="content_area"></div>
+
+                <script>
+                    let historyData = JSON.parse('${escapedHistoryJson}');
+
+                    function sendAllMemos(actionType) {
+                        const memoUpdates = [];
+                        const textareas = document.querySelectorAll('.memo-input');
+
+                        textareas.forEach(textarea => {
+                            const recordId = textarea.id.split('-')[2];
+                            memoUpdates.push({
+                                id: recordId,
+                                memo: textarea.value
+                            });
+                            const index = historyData.findIndex(item => item.id === recordId);
+                            if (index > -1) {
+                                historyData[index].memo = textarea.value;
+                            }
+                        });
+
+                        window.opener.postMessage({
+                            source: 'soop_time_recorder_popup',
+                            action: 'SAVE_ALL_MEMOS',
+                            historyUpdates: memoUpdates,
+                            value: actionType
+                        }, '*');
+                    }
+
+                    window.onbeforeunload = function() {
+                        sendAllMemos('CLOSING');
+                    };
+
+                    window.startCopy = function() {
+                        copyFullHistory(true);
+                    };
+
+                    function sendMessage(action, id, value) {
+                        window.opener.postMessage({
+                            source: 'soop_time_recorder_popup',
+                            action: action,
+                            id: id,
+                            value: value
+                        }, '*');
+                    }
+
+                    function copyFullHistory(isSaved) {
+                        if (!isSaved) {
+                            sendAllMemos('COPYING');
+                            return;
+                        }
+
+                        const textToCopy = historyData.slice().reverse().map(item => {
+                            const baseTime = '[ ' + item.videoTime + ' ]';
+                            const memoText = item.memo ? item.memo.trim() : "";
+                            return memoText ? baseTime + ' - ' + memoText : baseTime;
+                        }).join('\\n');
+
+                        if (!textToCopy) {
+                            alert('복사할 기록이 없습니다.');
+                            return;
+                        }
+
+                        const tempTextArea = document.createElement('textarea');
+                        tempTextArea.value = textToCopy;
+                        tempTextArea.style.position = 'fixed';
+                        tempTextArea.style.left = '-9999px';
+                        document.body.appendChild(tempTextArea);
+
+                        try {
+                            tempTextArea.select();
+                            if (document.execCommand('copy')) {
+                                alert('✔ 전체 기록이 클립보드에 복사되었습니다.\\n팝업 창을 닫습니다.');
+                                window.close();
+                            } else {
+                                alert('클립보드 복사에 실패했습니다. (execCommand 실패)');
+                            }
+                        } catch (err) {
+                            console.error('클립보드 복사 실패:', err);
+                            alert('클립보드 복사에 실패했습니다. (보안 오류)');
+                        } finally {
+                            document.body.removeChild(tempTextArea);
+                        }
+                    }
+
+                    document.body.addEventListener('click', function(event) {
+                        const target = event.target;
+                        if (target.id === 'copy_btn') {
+                            copyFullHistory(false);
+                        }
+                    });
+
+                    function renderHistoryContent(contentArea, historyArray) {
+                        if (!contentArea) return;
+                        const history = historyArray;
+
+                        contentArea.innerHTML = '';
+
+                        let listHTML = '<div id="list_container"><ul>';
+
+                        if (history.length === 0) {
+                            listHTML += '<p class="empty-message">저장된 기록이 없습니다.</p>';
+                        } else {
+                            [...history].reverse().forEach((item) => {
+                                listHTML += \`
+                                    <li id="item-\${item.id}">
+                                        <div class="header-line">
+                                            <span class="video-time">⏰ \${item.videoTime}</span>
+                                            <span class="saved-at">저장시각: \${item.savedAt}</span>
+                                        </div>
+                                        <textarea
+                                            id="memo-input-\${item.id}"
+                                            class="memo-input"
+                                            rows="2"
+                                            placeholder="메모를 입력하세요..."
+                                        >\${item.memo}</textarea>
+                                    </li>
+                                \`;
+                            });
+                        }
+                        listHTML += '</ul></div>';
+
+                        const copyButtonHTML = \`<button id="copy_btn" class="history-btn">📄 전체 목록 복사하기</button>\`;
+
+                        contentArea.innerHTML = listHTML + copyButtonHTML;
+                    }
+
+                    renderHistoryContent(document.getElementById('content_area'), historyData);
+
+                </script>
+            </body>
+            </html>
+        `);
+        doc.close();
+    }
+
+    function styleButton(btn, bgColor) {
+         btn.style.backgroundColor = bgColor;
+         btn.style.color = 'white';
+         btn.style.border = 'none';
+         btn.style.padding = '4px 8px';
+         btn.style.borderRadius = '3px';
+         btn.style.cursor = 'pointer';
+         btn.style.fontSize = '12px';
+         btn.style.fontWeight = 'bold';
+         btn.style.fontFamily = 'dotum, sans-serif';
+    }
+
+})();
